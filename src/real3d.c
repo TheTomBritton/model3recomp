@@ -622,6 +622,14 @@ static int64_t sample(const tri_t *tr, double u, double v, double lod)
     }
     lv = (unsigned)lod;
     f = lod - lv;
+    /* Blend two levels only across the middle half between them; near a
+     * level, that level alone. Half the texel reads, and the seams between
+     * levels stay as soft as anyone will see on a 384-line picture. */
+    if (f < 0.25 || f > 0.75) {
+        a = sample_level(tr, u, v, f < 0.25 ? lv : lv + 1u);
+        return a < 0 ? sample_level(tr, u, v, 0) : a;
+    }
+    f = (f - 0.25) * 2.0;
     a = sample_level(tr, u, v, lv);
     b = sample_level(tr, u, v, lv + 1u);
     if (a < 0 || b < 0) return sample_level(tr, u, v, 0);
@@ -1171,6 +1179,34 @@ static proj_t g_proj;
 typedef struct { int on; float r, g, b, density, start; } fog_t;
 static fog_t g_fog;
 
+/* Narrow [*xs, *xe] to where a x + c >= 0, give or take a pixel. Zero when
+ * nothing is left. */
+static int span_x(double a, double c, int *xs, int *xe)
+{
+    if (a > 1e-12) {
+        double b = -c / a - 1.0;
+        if (b > *xs) { if (b > *xe) return 0; *xs = (int)b; }
+    } else if (a < -1e-12) {
+        double b = -c / a + 1.0;
+        if (b < *xe) { if (b < *xs) return 0; *xe = (int)b; }
+    } else if (c < -1e-9)
+        return 0;
+    return *xs <= *xe;
+}
+
+/* log2 to a few thousandths, which is plenty for picking a mip level: the
+ * exponent, and a quadratic through the mantissa. */
+static float fast_log2(float x)
+{
+    union { float f; uint32_t i; } v;
+    float e, m;
+    v.f = x;
+    e = (float)((int)((v.i >> 23) & 0xFFu) - 127);
+    v.i = (v.i & 0x007FFFFFu) | 0x3F800000u;
+    m = v.f;
+    return e + (-0.34484843f * m + 2.02466578f) * m - 0.67487759f;
+}
+
 /* ---- triangle setup ------------------------------------------------------
  *
  * Culling, the near clip, projection and the per-triangle constants, once
@@ -1446,14 +1482,24 @@ static void raster(const vpjob_t *j, uint32_t *fb, int fw, int by0, int by1)
         if (y0 < by0) y0 = by0;
         if (y1 > by1) y1 = by1;
         if (y1 < y0) continue;
+        /* The barycentrics are linear in x along a row: l = a x + c. Each
+         * row's span where all three are non-negative is solved once, a
+         * pixel wider each side, so most of a thin or slanted triangle's
+         * box is never visited; the per-pixel test still decides. */
+        const double a0 = (p[1][1]-p[2][1]) * invd, b0 = (p[2][0]-p[1][0]) * invd;
+        const double a1 = (p[2][1]-p[0][1]) * invd, b1 = (p[0][0]-p[2][0]) * invd;
         for (y = y0; y <= y1; y++) {
-            for (x = x0; x <= x1; x++) {
+            const double c0 = b0 * (y - p[2][1]) - a0 * p[2][0];
+            const double c1 = b1 * (y - p[2][1]) - a1 * p[2][0];
+            int xs = x0, xe = x1;
+            if (!span_x(a0, c0, &xs, &xe) || !span_x(a1, c1, &xs, &xe)
+                || !span_x(-(a0 + a1), 1.0 - c0 - c1, &xs, &xe))
+                continue;
+            for (x = xs; x <= xe; x++) {
                 double l0, l1, l2, z;
                 int o;
-                l0 = ((p[1][1]-p[2][1])*(x-p[2][0])
-                    + (p[2][0]-p[1][0])*(y-p[2][1])) * invd;
-                l1 = ((p[2][1]-p[0][1])*(x-p[2][0])
-                    + (p[0][0]-p[2][0])*(y-p[2][1])) * invd;
+                l0 = a0 * x + c0;
+                l1 = a1 * x + c1;
                 l2 = 1.0f - l0 - l1;
                 if (l0 < 0 || l1 < 0 || l2 < 0) continue;
                 z = l0*p[0][2] + l1*p[1][2] + l2*p[2][2];
@@ -1477,7 +1523,7 @@ static void raster(const vpjob_t *j, uint32_t *fb, int fw, int by0, int by1)
                                 double vx = (gq[1][0] - vv * gq[2][0]) / iz, vy = (gq[1][1] - vv * gq[2][1]) / iz;
                                 double rx = ux*ux + vx*vx, ry = uy*uy + vy*vy;
                                 double rho = rx > ry ? rx : ry;
-                                if (rho > 1.0) lod = 0.5 * log2(rho);
+                                if (rho > 1.0) lod = 0.5f * fast_log2((float)rho);
                             }
                             w = sample(tr, uu, vv, lod);
                             if (w < 0) { g_texel_missing++; note_miss(tr); }
