@@ -50,6 +50,12 @@ target_include_directories(model3recomp
 if(EMSCRIPTEN)
     target_compile_options(model3recomp PUBLIC -pthread)
     target_link_options(model3recomp PUBLIC -pthread)
+    # The 68000 core setjmps on every m68k_execute() for its bus-error trap.
+    # Emscripten's default setjmp goes through JavaScript for every call made
+    # inside such a function, a large share of the sound board's thread;
+    # WebAssembly's own exception handling does it in place.
+    target_compile_options(model3recomp PUBLIC -sSUPPORT_LONGJMP=wasm)
+    target_link_options(model3recomp PUBLIC -sSUPPORT_LONGJMP=wasm)
 elseif(SDL2_FOUND)
     target_link_libraries(model3recomp PUBLIC SDL2::SDL2)
 else()
