@@ -20,11 +20,11 @@
 #include "model3recomp/model3recomp.h"
 
 #include <emscripten.h>
+#include <emscripten/threading.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 /* The controls, as the page writes them. Pointer positions are framebuffer
  * pixels (0..w-1, 0..h-1); the gun mapping clamps anything outside. */
@@ -168,7 +168,7 @@ static void throttle(void)
         next = now;
     next += 1000.0 / 57.524;
     if (next - now > 1.0)
-        usleep((useconds_t)((next - now - 0.5) * 1000.0));
+        emscripten_thread_sleep(next - now - 0.5);   /* ms; the guest is on a pthread */
     while (emscripten_get_now() < next) { }
 }
 
