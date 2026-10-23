@@ -46,6 +46,7 @@
  * direction is invented outright, and there are no textures.
  */
 #include "model3recomp/real3d.h"
+#include "model3recomp/tilegen.h"
 #include "model3recomp/savestate.h"
 #include "model3recomp/bus.h"
 #include "model3recomp/platform.h"
@@ -57,7 +58,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_TRIS   40000u
+#define MAX_TRIS   65536u     /* a field's, every viewport together */
 #define MAX_DEPTH  24
 #define AMBIENT    g_ambient
 
@@ -408,6 +409,11 @@ static uint32_t bswap32_(uint32_t v)
          | ((v << 8) & 0xFF0000u) | ((v << 24) & 0xFF000000u);
 }
 
+/* Deferred (real3d_set_deferred): uploads wait in the field's queue for the
+ * thread that draws it. */
+static int g_deferred;
+static void queue_tex(uint32_t kind, uint32_t a, uint32_t b, const uint8_t *p, size_t n);
+
 void real3d_vrom_texture(uint32_t addr, uint32_t header, uint32_t ctrl)
 {
     size_t n = 0;
@@ -427,17 +433,16 @@ void real3d_vrom_texture(uint32_t addr, uint32_t header, uint32_t ctrl)
      * and the addresses reach past it, so it is mirrored -- the way bit 23
      * of a model address selects VROM and is then dropped. */
     off = ((size_t)a * 4u) % n;
+    if (g_deferred) { queue_tex(1, h, (uint32_t)off, NULL, 0); return; }
     g_src_be = 1;                  /* VROM is big-endian; the FIFO is not */
     upload_texture(h, v + off, n - off);
     g_src_be = 0;
 }
 
 /* Drain whatever the guest has put in the FIFO since last time. */
-static void flush_texture_fifo(void)
+static void apply_fifo(const uint8_t *f, size_t used)
 {
-    size_t used = 0, i;
-    const uint8_t *f = bus_texfifo(&used, NULL);
-    if (!f || used <= g_fifo_seen) return;
+    size_t i;
     for (i = 0; i + 8 <= used; ) {
         uint32_t len = rd32le(f + i);
         uint32_t words = (2u + len / 2u) / 4u;
@@ -453,6 +458,15 @@ static void flush_texture_fifo(void)
         upload_texture(header, f + i + 8, (size_t)words * 4u - 8u);
         i += (size_t)words * 4u;
     }
+}
+
+static void flush_texture_fifo(void)
+{
+    size_t used = 0;
+    const uint8_t *f = bus_texfifo(&used, NULL);
+    if (!f || used <= g_fifo_seen) return;
+    if (g_deferred) queue_tex(0, 0, 0, f, used);
+    else apply_fifo(f, used);
     g_fifo_seen = used;
     if (getenv("M3_TEX_TRACE"))
         fprintf(stderr, "[tex] fifo %u bytes, %u uploads so far%s",
@@ -621,6 +635,10 @@ static int64_t sample(const tri_t *tr, double u, double v, double lod)
     }
 }
 static unsigned g_ntris;
+
+/* The triangles raster() draws: one viewport's run of g_tris. */
+static const tri_t *g_rtris;
+static unsigned g_rn;
 
 typedef struct { int on, lum, two_sided, alpha, alpha_test, tex_alpha, mirror, fog, spec, shine; unsigned x, y, page, w, h, fmt; } texdesc_t;
 
@@ -1136,7 +1154,8 @@ static void note_miss(const tri_t *t)
 
 /* Where a viewport's view space lands on the screen: pixel = a * (X/Z) + b,
  * and the rectangle it may draw in. */
-static struct { double ax, bx, ay, by; int x0, y0, x1, y1; } g_proj;
+typedef struct { double ax, bx, ay, by; int x0, y0, x1, y1; } proj_t;
+static proj_t g_proj;
 
 /* A viewport's fog. MAME documents the words: 0x22 the fog colour, 0x23
  * the density (a float), 0x25 the "fog offset" in its low half and the
@@ -1149,51 +1168,78 @@ static struct { double ax, bx, ay, by; int x0, y0, x1, y1; } g_proj;
  * The game ramps the offset from 0.5 to 1 with a black fog colour to fade a
  * scene out, which only reads as a fade if the offset is a share of the
  * whole and not a distance. */
-static struct { int on; float r, g, b, density, start; } g_fog;
+typedef struct { int on; float r, g, b, density, start; } fog_t;
+static fog_t g_fog;
 
-static void raster(uint32_t *fb, int fw, int fh, float sx, float sy,
-                   const float L[3], float intensity, int by0, int by1)
+/* ---- triangle setup ------------------------------------------------------
+ *
+ * Culling, the near clip, projection and the per-triangle constants, once
+ * per viewport, into a list of screen triangles in drawing order: opaque
+ * first, then translucent. raster() then only fills pixels, so cutting the
+ * screen into many slices for the threads costs nothing per slice beyond a
+ * y-range test, and the setup runs on the guest's thread while the last
+ * field's picture is still being drawn. */
+typedef struct {
+    int y0, y1, x0, x1;             /* the screen box, clipped to the viewport */
+    const tri_t *tr;
+    unsigned src;                   /* index in the viewport's run, for M3_PICK */
+    uint32_t argb;                  /* flat shade */
+    double p[3][3], q[3][3], gq[3][2], invd;
+} stri_t;
+
+/* A viewport the walk found: its run of triangles and everything raster()
+ * reads, so that it can be drawn later, and by several threads at once. */
+typedef struct {
+    unsigned first, count;          /* the viewport's run of g_tris */
+    unsigned s0, s1;                /* its screen triangles, st[s0 .. s1) */
+    const stri_t *st;
+    proj_t proj;
+    fog_t fog;
+    float ambient, sx, sy, light[3], intensity;
+    uint32_t fogw[3];               /* viewport words 0x20, 0x22, 0x25, for scroll_fog() */
+} vpjob_t;
+
+/* Everything a field's walk produces, twice over: deferred, the guest walks
+ * the next field into one set while the other is still being drawn. */
+typedef struct {
+    tri_t *tris;
+    stri_t *stris;
+    unsigned cap_stris;
+    vpjob_t jobs[64];               /* 16 viewports a priority, four priorities */
+    unsigned njobs;
+    uint8_t *tex;                   /* texture uploads queued for this field */
+    size_t ntex, cap_tex;
+} fieldset_t;
+static fieldset_t g_set[2];
+static int g_col;                   /* the set being walked into */
+static stri_t *g_stris;             /* g_set[g_col]'s, while walking */
+static unsigned g_nstris, g_cap_stris;
+
+static void setup_tris(int fw, int fh, const float L[3], float intensity)
 {
-    /* The light comes from the viewport now, not from an invention.
-     * Words 0x04..0x06 are a unit vector -- (-0.72288, -0.16226, -0.67156)
-     * in this game, length 1.0000 to five places, and the same in every
-     * scene dumped -- which is what identifies them. Word 0x07 sits with
-     * Word 0x07 is a global brightness multiplier, and it took a second
-     * look to see it. It was dismissed once for reading 0.93 in one attract
-     * shot and 0.06 in another that was plainly not six per cent as bright
-     * -- which was two moments compared without asking what happened
-     * between them. Sampled every field it is unmistakable: it holds at
-     * exactly 1.0000 for a thousand fields, ramps down in even steps to
-     * 0.0000, holds there through the gap between demo shots, and ramps
-     * back. It is the cross-fade.
-     *
-     * Ignoring it is what made the renderer look frozen: the game spent
-     * twenty fields fading a shot to black and the picture stayed at full
-     * brightness, byte-identical, while the scene underneath it changed
-     * every field. */
     unsigned t;
 
     /* Where the geometry actually is, in view space. A scene that comes
      * out empty is usually not a rasteriser problem: it is geometry that
      * never reaches the screen, and the bounds say so in one line. */
-    if (by0 == 0 && getenv("M3_REAL3D_STATS") && g_ntris) {
+    if (getenv("M3_REAL3D_STATS") && g_rn) {
         float lo[3], hi[3];
         unsigned i, k, behind = 0;
         for (k = 0; k < 3; k++) { lo[k] = 1e30f; hi[k] = -1e30f; }
-        for (i = 0; i < g_ntris; i++) {
+        for (i = 0; i < g_rn; i++) {
             unsigned j;
             for (j = 0; j < 3; j++) {
                 for (k = 0; k < 3; k++) {
-                    float v = g_tris[i].v[j][k];
+                    float v = g_rtris[i].v[j][k];
                     if (v < lo[k]) lo[k] = v;
                     if (v > hi[k]) hi[k] = v;
                 }
-                if (g_tris[i].v[j][2] <= 0.0f) behind++;
+                if (g_rtris[i].v[j][2] <= 0.0f) behind++;
             }
         }
         fprintf(stderr, "[real3d]     view bounds x %.0f..%.0f  y %.0f..%.0f"
                         "  z %.0f..%.0f  %u/%u verts at z<=0\n",
-                lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], behind, g_ntris * 3u);
+                lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], behind, g_rn * 3u);
         g_cull_back = g_cull_near = g_cull_degen = g_cull_off = 0;
     }
 
@@ -1201,8 +1247,8 @@ static void raster(uint32_t *fb, int fw, int fh, float sx, float sy,
      * order, blended and leaving the depth buffer alone. A polygon whose
      * texels carry alpha (word 6's translucency mode) counts as
      * translucent: smoke, glass and shadows are made of those. */
-    for (t = 0; t < 2u * g_ntris; t++) {
-        const tri_t *tr = &g_tris[t % g_ntris];
+    for (t = 0; t < 2u * g_rn; t++) {
+        const tri_t *tr = &g_rtris[t % g_rn];
         /* Screen-space vertices in double. A projected triangle here can
          * reach coordinates in the hundreds of thousands -- the scene runs
          * well past the edges of a 496-pixel screen -- and in float the
@@ -1214,9 +1260,9 @@ static void raster(uint32_t *fb, int fw, int fh, float sx, float sy,
         float clipped[4][5], src[3][5];
         double d, invd;
         float lit, sh;
-        if ((tr->alpha < 255 || (tr->textured && tr->tex_alpha)) != (t >= g_ntris)) continue;
+        if ((tr->alpha < 255 || (tr->textured && tr->tex_alpha)) != (t >= g_rn)) continue;
         int nclip, fan;
-        int x0, x1, y0, y1, x, y, k;
+        int x0, x1, y0, y1, k;
         int r, g, b;
         uint32_t argb;
 
@@ -1312,8 +1358,6 @@ static void raster(uint32_t *fb, int fw, int fh, float sx, float sy,
         }
         if (x0 < g_proj.x0) x0 = g_proj.x0;
         if (y0 < g_proj.y0) y0 = g_proj.y0;
-        if (y0 < by0) y0 = by0;
-        if (y1 > by1) y1 = by1;
         if (x1 > g_proj.x1) x1 = g_proj.x1;
         if (y1 > g_proj.y1) y1 = g_proj.y1;
         if (x1 < x0 || y1 < y0) { g_cull_off++; continue; }
@@ -1353,6 +1397,55 @@ static void raster(uint32_t *fb, int fw, int fh, float sx, float sy,
                 gq[k][1] = l0y * (q[0][k] - q[2][k]) + l1y * (q[1][k] - q[2][k]);
             }
         }
+        if (g_nstris >= g_cap_stris) {
+            unsigned cap = g_cap_stris ? g_cap_stris * 2u : 8192u;
+            stri_t *n = (stri_t *)realloc(g_stris, sizeof(stri_t) * cap);
+            if (!n) continue;
+            g_stris = n; g_cap_stris = cap;
+        }
+        {
+            stri_t *st = &g_stris[g_nstris++];
+            st->y0 = y0; st->y1 = y1; st->x0 = x0; st->x1 = x1;
+            st->tr = tr; st->src = t % g_rn; st->argb = argb;
+            memcpy(st->p, p, sizeof st->p);
+            memcpy(st->q, q, sizeof st->q);
+            memcpy(st->gq, gq, sizeof st->gq);
+            st->invd = invd;
+        }
+        }
+    }
+}
+
+static void raster(const vpjob_t *j, uint32_t *fb, int fw, int by0, int by1)
+{
+    /* The light comes from the viewport now, not from an invention.
+     * Words 0x04..0x06 are a unit vector -- (-0.72288, -0.16226, -0.67156)
+     * in this game, length 1.0000 to five places, and the same in every
+     * scene dumped -- which is what identifies them. Word 0x07 sits with
+     * Word 0x07 is a global brightness multiplier, and it took a second
+     * look to see it. It was dismissed once for reading 0.93 in one attract
+     * shot and 0.06 in another that was plainly not six per cent as bright
+     * -- which was two moments compared without asking what happened
+     * between them. Sampled every field it is unmistakable: it holds at
+     * exactly 1.0000 for a thousand fields, ramps down in even steps to
+     * 0.0000, holds there through the gap between demo shots, and ramps
+     * back. It is the cross-fade.
+     *
+     * Ignoring it is what made the renderer look frozen: the game spent
+     * twenty fields fading a shot to black and the picture stayed at full
+     * brightness, byte-identical, while the scene underneath it changed
+     * every field. */
+    unsigned si;
+    for (si = j->s0; si < j->s1; si++) {
+        const stri_t *st = &j->st[si];
+        const tri_t *tr = st->tr;
+        const double (*p)[3] = st->p, (*q)[3] = st->q, (*gq)[2] = st->gq;
+        const double invd = st->invd;
+        const uint32_t argb = st->argb;
+        int x0 = st->x0, x1 = st->x1, y0 = st->y0, y1 = st->y1, x, y;
+        if (y0 < by0) y0 = by0;
+        if (y1 > by1) y1 = by1;
+        if (y1 < y0) continue;
         for (y = y0; y <= y1; y++) {
             for (x = x0; x <= x1; x++) {
                 double l0, l1, l2, z;
@@ -1424,13 +1517,13 @@ static void raster(uint32_t *fb, int fw, int fh, float sx, float sy,
                     float nl = nx*nx + ny*ny + nz*nz;
                     if (nl > 1e-6f) {
                         float il = 1.0f / sqrtf(nl);
-                        float d = (nx*L[0] + ny*L[1] + nz*L[2]) * il;
+                        float d = (nx*j->light[0] + ny*j->light[1] + nz*j->light[2]) * il;
                         float s2;
                         int rr, gg, bb;
                         if (d < 0) d = 0;
                         if (d > 1.0f) d = 1.0f;
-                        s2 = tr->luminous ? intensity
-                           : (AMBIENT + (1.0f - AMBIENT) * d) * intensity;
+                        s2 = tr->luminous ? j->intensity
+                           : (j->ambient + (1.0f - j->ambient) * d) * j->intensity;
                         rr = (int)(tr->r * s2); gg = (int)(tr->g * s2);
                         bb = (int)(tr->b * s2);
                         if (rr > 255) rr = 255;
@@ -1447,12 +1540,12 @@ static void raster(uint32_t *fb, int fw, int fh, float sx, float sy,
                              * down +z, raised to a power that doubles with
                              * each step of shininess, white, scaled by the
                              * coefficient over 63 and the sun's strength. */
-                            float hx = L[0], hy = L[1], hz = L[2] - 1.0f;
+                            float hx = j->light[0], hy = j->light[1], hz = j->light[2] - 1.0f;
                             float hl = hx*hx + hy*hy + hz*hz;
                             float nh = hl > 1e-12f ? (nx*hx + ny*hy + nz*hz) * il / sqrtf(hl) : 0.0f;
                             if (nh > 0.0f) {
                                 float sp = powf(nh, (float)(16 << tr->shine)) * (float)tr->spec / 63.0f
-                                         * (intensity < 1.0f ? intensity : 1.0f);
+                                         * (j->intensity < 1.0f ? j->intensity : 1.0f);
                                 int add = (int)(sp * 255.0f);
                                 rr += add; gg += add; bb += add;
                                 if (rr > 255) rr = 255;
@@ -1463,16 +1556,16 @@ static void raster(uint32_t *fb, int fw, int fh, float sx, float sy,
                         c = 0xFF000000u | ((uint32_t)rr << 16)
                           | ((uint32_t)gg << 8) | (uint32_t)bb;
                     }
-                    if (g_fog.on && tr->fog) {
+                    if (j->fog.on && tr->fog) {
                         double w = l0*q[0][2] + l1*q[1][2] + l2*q[2][2];   /* 1/z */
-                        double f = g_fog.start + (w > 1e-12 ? g_fog.density / w : 1.0);
+                        double f = j->fog.start + (w > 1e-12 ? j->fog.density / w : 1.0);
                         f = (f < 0.0 ? 0.0 : f > 1.0 ? 1.0 : f) * tr->fog / 16.0;
                         if (f > 1.0) f = 1.0;
                         if (f > 0.0) {
                             float k = (float)f;
                             uint32_t m = 0xFF000000u;
                             int sh3;
-                            const float fc[3] = { g_fog.b, g_fog.g, g_fog.r };
+                            const float fc[3] = { j->fog.b, j->fog.g, j->fog.r };
                             for (sh3 = 0; sh3 < 3; sh3++) {
                                 float v = (float)((c >> (8 * sh3)) & 0xFFu);
                                 m |= (uint32_t)(v + (fc[sh3] - v) * k + 0.5f) << (8 * sh3);
@@ -1499,10 +1592,9 @@ static void raster(uint32_t *fb, int fw, int fh, float sx, float sy,
                     }
                     g_drawn++;
                     if (tr->textured) g_tex_px++; else g_flat_px++;
-                    if (o == g_pick) g_pick_tri = (long)(t % g_ntris);
+                    if (o == g_pick) g_pick_tri = (long)st->src;
                 }
             }
-        }
         }
     }
 }
@@ -1542,15 +1634,25 @@ static struct {
     m3_lock  lock;
     m3_cond  go, done;
     unsigned gen, pending;
-    uint32_t *fb; int fw, fh; float sx, sy, L[3], intensity;
+    void   (*fn)(int band);     /* what each thread does this round */
+    const vpjob_t *job;
+    uint32_t *fb; int fw, fh;
     int      y0, y1;            /* the rows being banded */
 } g_pool;
 
-static void band_rows(int i, int *by0, int *by1)
+/* Thread i draws every bands-th slice of SLICE rows, starting from its own:
+ * one solid strip each left most threads idle while the one with the busy
+ * part of the screen finished. */
+#define SLICE 8
+
+/* One viewport, every thread a share of its rows. */
+static void band_draw(int i)
 {
-    int rows = g_pool.y1 - g_pool.y0 + 1;
-    *by0 = g_pool.y0 + rows * i / g_pool.bands;
-    *by1 = g_pool.y0 + rows * (i + 1) / g_pool.bands - 1;
+    int y;
+    for (y = g_pool.y0 + i * SLICE; y <= g_pool.y1; y += g_pool.bands * SLICE) {
+        int y1 = y + SLICE - 1;
+        raster(g_pool.job, g_pool.fb, g_pool.fw, y, y1 < g_pool.y1 ? y1 : g_pool.y1);
+    }
 }
 
 #ifdef _WIN32
@@ -1559,16 +1661,14 @@ static DWORD WINAPI band_worker(LPVOID arg)
 static void *band_worker(void *arg)
 #endif
 {
-    int i = (int)(intptr_t)arg, by0, by1;
+    int i = (int)(intptr_t)arg;
     unsigned seen = 0;
     for (;;) {
         LOCK(&g_pool.lock);
         while (g_pool.gen == seen) WAIT(&g_pool.go, &g_pool.lock);
         seen = g_pool.gen;
         UNLOCK(&g_pool.lock);
-        band_rows(i, &by0, &by1);
-        raster(g_pool.fb, g_pool.fw, g_pool.fh, g_pool.sx, g_pool.sy,
-               g_pool.L, g_pool.intensity, by0, by1);
+        g_pool.fn(i);
         LOCK(&g_pool.lock);
         if (--g_pool.pending == 0) WAKE_ALL(&g_pool.done);
         UNLOCK(&g_pool.lock);
@@ -1614,36 +1714,35 @@ static void pool_start(void)
     }
 }
 
-static void raster_bands(uint32_t *fb, int fw, int fh, float sx, float sy,
-                         const float L[3], float intensity)
+/* fn(i) on every thread, the caller as thread 0, back when all are done. */
+static void pool_run(void (*fn)(int band))
 {
     static int started;
-    int by0, by1;
-    if (getenv("M3_REAL3D_STATS") || g_pick >= 0) {
-        raster(fb, fw, fh, sx, sy, L, intensity, 0, fh - 1);
-        return;
-    }
     if (!started) { started = 1; pool_start(); }
-    if (g_pool.bands <= 1) {
-        raster(fb, fw, fh, sx, sy, L, intensity, 0, fh - 1);
-        return;
-    }
+    g_pool.fn = fn;
+    if (g_pool.bands <= 1) { fn(0); return; }
     LOCK(&g_pool.lock);
-    g_pool.fb = fb; g_pool.fw = fw; g_pool.fh = fh; g_pool.sx = sx; g_pool.sy = sy;
-    g_pool.L[0] = L[0]; g_pool.L[1] = L[1]; g_pool.L[2] = L[2];
-    g_pool.intensity = intensity;
-    g_pool.y0 = g_proj.y0; g_pool.y1 = g_proj.y1;
     g_pool.pending = (unsigned)g_pool.bands - 1u;
     g_pool.gen++;
     WAKE_ALL(&g_pool.go);
     UNLOCK(&g_pool.lock);
 
-    band_rows(0, &by0, &by1);
-    raster(fb, fw, fh, sx, sy, L, intensity, by0, by1);
+    fn(0);
 
     LOCK(&g_pool.lock);
     while (g_pool.pending) WAIT(&g_pool.done, &g_pool.lock);
     UNLOCK(&g_pool.lock);
+}
+
+static void raster_bands(const vpjob_t *j, uint32_t *fb, int fw, int fh)
+{
+    if (getenv("M3_REAL3D_STATS") || g_pick >= 0) {
+        raster(j, fb, fw, 0, fh - 1);
+        return;
+    }
+    g_pool.job = j; g_pool.fb = fb; g_pool.fw = fw; g_pool.fh = fh;
+    g_pool.y0 = j->proj.y0; g_pool.y1 = j->proj.y1;
+    pool_run(band_draw);
 }
 
 /* ---- scroll fog ----------------------------------------------------------
@@ -1653,17 +1752,18 @@ static void raster_bands(uint32_t *fb, int fw, int fh, float sx, float sy,
  * fog colour, dimmed by the ambient fog, by that byte over 255. The Lost
  * World's intro uses it -- "SOMETHING HAS SURVIVED" sets 0.29 of E0E0FF over
  * the storm backdrop -- and nothing else does. */
-static void scroll_fog(uint32_t *fb, int fw, const uint8_t *vp)
+static void scroll_fog(uint32_t *fb, int fw, const vpjob_t *j, int ry0, int ry1)
 {
-    float a = (float)(rd32le(vp + 0x20 * 4) & 0xFFu) / 255.0f;
-    uint32_t col = rd32le(vp + 0x22 * 4);
-    float dim = (float)((rd32le(vp + 0x25 * 4) >> 16) & 0xFFu) / 255.0f;
+    const uint32_t *w = j->fogw;
+    float a = (float)(w[0] & 0xFFu) / 255.0f;     /* viewport words 0x20, 0x22, 0x25 */
+    uint32_t col = w[1];
+    float dim = (float)((w[2] >> 16) & 0xFFu) / 255.0f;
     float fc[3];
     int x, y, k;
     if (a <= 0.0f || g_no_fog) return;
     for (k = 0; k < 3; k++) fc[k] = dim * (float)((col >> (8 * k)) & 0xFFu);
-    for (y = g_proj.y0; y <= g_proj.y1; y++)
-        for (x = g_proj.x0; x <= g_proj.x1; x++) {
+    for (y = j->proj.y0 > ry0 ? j->proj.y0 : ry0; y <= j->proj.y1 && y <= ry1; y++)
+        for (x = j->proj.x0; x <= j->proj.x1; x++) {
             uint32_t d = fb[y * fw + x], m = 0xFF000000u;
             for (k = 0; k < 3; k++) {
                 float v = (float)((d >> (8 * k)) & 0xFFu);
@@ -1673,13 +1773,131 @@ static void scroll_fog(uint32_t *fb, int fw, const uint8_t *vp)
         }
 }
 
+/* ---- drawing the field ------------------------------------------------
+ *
+ * Walking the scene reads guest memory, so it happens on the guest's thread
+ * at the end of a field. Drawing it does not: each viewport the walk finds is
+ * kept as a job (vpjob_t) and drawn either at once, or -- deferred -- later,
+ * by real3d_compose() on the thread that composes the picture while the
+ * guest runs the next field. Deferred, the walk goes into one of two sets and
+ * the texture uploads are queued with it, so nothing the drawing threads
+ * read is written under them; model3recomp_end_frame() does not hand the
+ * guest a set back until its picture is finished. */
+
+/* One viewport over rows ry0..ry1. A fresh depth buffer per viewport: they
+ * are separate layers, not one scene. Sharing a buffer lets whichever
+ * viewport is walked first decide the depth of the whole screen, and the
+ * first one here holds a flat quad that covers it. */
+static void job_rows(const vpjob_t *j, uint32_t *fb, int fw, int ry0, int ry1)
+{
+    int i, n = (ry1 - ry0 + 1) * fw;
+    float *z = g_zbuf + (size_t)ry0 * fw;
+    for (i = 0; i < n; i++) z[i] = 1e30f;
+    scroll_fog(fb, fw, j, ry0, ry1);
+    raster(j, fb, fw, ry0, ry1);
+}
+
+/* Not deferred: the viewport just walked, now, on every core. */
+static void draw_job(const vpjob_t *j, uint32_t *fb, int fw, int fh)
+{
+    int i, nn = fw * fh;
+    for (i = 0; i < nn; i++) g_zbuf[i] = 1e30f;
+    scroll_fog(fb, fw, j, 0, fh - 1);
+    raster_bands(j, fb, fw, fh);
+}
+
+/* Deferred texture uploads, in the order the guest made them: a copy of the
+ * FIFO as the walk found it (kind 0), or a VROM load (kind 1: header, offset
+ * into VROM). */
+static void queue_tex(uint32_t kind, uint32_t a, uint32_t b, const uint8_t *p, size_t n)
+{
+    size_t need = 16u + ((n + 3u) & ~(size_t)3u);
+    fieldset_t *q = &g_set[g_col];
+    uint32_t hd[4];
+    if (q->ntex + need > q->cap_tex) {
+        size_t cap = q->cap_tex ? q->cap_tex * 2u : 1u << 20;
+        uint8_t *m;
+        while (cap < q->ntex + need) cap *= 2u;
+        m = (uint8_t *)realloc(q->tex, cap);
+        if (!m) return;
+        q->tex = m; q->cap_tex = cap;
+    }
+    hd[0] = kind; hd[1] = a; hd[2] = b; hd[3] = (uint32_t)n;
+    memcpy(q->tex + q->ntex, hd, 16);
+    if (n) memcpy(q->tex + q->ntex + 16, p, n);
+    q->ntex += need;
+}
+
+static void apply_tex(int k)
+{
+    size_t i = 0;
+    while (i + 16u <= g_set[k].ntex) {
+        uint32_t hd[4];
+        memcpy(hd, g_set[k].tex + i, 16);
+        if (hd[0] == 0) apply_fifo(g_set[k].tex + i + 16, hd[3]);
+        else {
+            size_t n = 0;
+            const uint8_t *v = bus_vrom(&n);
+            if (v && hd[2] < n) {
+                g_src_be = 1;
+                upload_texture(hd[1], v + hd[2], n - hd[2]);
+                g_src_be = 0;
+            }
+        }
+        i += 16u + ((hd[3] + 3u) & ~(size_t)3u);
+    }
+    g_set[k].ntex = 0;
+}
+
+void real3d_set_deferred(int on) { g_deferred = on; }
+
+int real3d_flip(void)
+{
+    int k = g_col;
+    g_col ^= 1;
+    return k;
+}
+
+int real3d_set_index(void) { return g_col; }
+
+/* The whole picture of set k, deferred, on every core: a thread takes its
+ * slices of rows and draws them from the bottom up -- the tilemaps behind,
+ * each viewport, the tilemaps in front -- so a field is one round of the
+ * pool, not one per viewport plus the tilemaps on their own. */
+static int g_ck;
+static void compose_band(int i)
+{
+    int fw = g_pool.fw, fh = g_pool.fh, y;
+    unsigned n;
+    for (y = i * SLICE; y < fh; y += g_pool.bands * SLICE) {
+        int y1 = y + SLICE - 1 < fh - 1 ? y + SLICE - 1 : fh - 1;
+        memset(g_pool.fb + (size_t)y * fw, 0, sizeof(uint32_t) * (size_t)(y1 - y + 1) * fw);
+        tilegen_render_rows(0, y, y1);
+        for (n = 0; n < g_set[g_ck].njobs; n++)
+            job_rows(&g_set[g_ck].jobs[n], g_pool.fb, fw, y, y1);
+        tilegen_render_rows(1, y, y1);
+    }
+}
+
+void real3d_compose(int k)
+{
+    int fw = 0, fh = 0;
+    uint32_t *fb = platform_framebuffer(&fw, &fh);
+    if (!fb || !g_zbuf || fw != g_zw || fh != g_zh) return;
+    apply_tex(k);
+    tilegen_set_source(k);
+    g_ck = k;
+    g_pool.fb = fb; g_pool.fw = fw; g_pool.fh = fh;
+    pool_run(compose_band);
+}
+
 /* ---- entry point ------------------------------------------------------- */
 void real3d_render(void)
 {
     int fw = 0, fh = 0;
     uint32_t *fb = platform_framebuffer(&fw, &fh);
     uint32_t vpaddr;
-    unsigned guard, total = 0, prio;
+    unsigned guard, total = 0, prio, first;
     static int inited;
 
     if (!fb) return;
@@ -1698,12 +1916,15 @@ void real3d_render(void)
         g_no_spec = getenv("M3_NO_SPECULAR") != NULL;
         e = getenv("M3_AMBIENT");
         if (e) { g_ambient = (float)atof(e); g_ambient_forced = 1; }
-        g_tris = (tri_t *)malloc(sizeof(tri_t) * MAX_TRIS);
+        g_set[0].tris = (tri_t *)malloc(sizeof(tri_t) * MAX_TRIS);
+        g_set[1].tris = (tri_t *)malloc(sizeof(tri_t) * MAX_TRIS);
         if (!g_sheet) g_sheet = (uint16_t *)calloc(TEX_W * TEX_H, sizeof(uint16_t));
         if (!g_sheet_set) g_sheet_set = (uint8_t *)calloc(TEX_W * TEX_H, 1);
         inited = 1;
     }
-    if (!g_tris) return;
+    if (!g_set[0].tris || !g_set[1].tris) return;
+    g_tris = g_set[g_col].tris;
+    g_stris = g_set[g_col].stris; g_cap_stris = g_set[g_col].cap_stris;
 
     flush_texture_fifo();
 
@@ -1716,10 +1937,9 @@ void real3d_render(void)
         g_zw = fw; g_zh = fh;
     }
     if (!g_zbuf) return;
-    {
-        int i, nn = fw * fh;
-        for (i = 0; i < nn; i++) g_zbuf[i] = 1e30f;
-    }
+    g_ntris = 0;
+    g_nstris = 0;
+    g_set[g_col].njobs = 0;
 
     /* M3_TEX_DUMP=<file>, M3_TEX_DUMP_AT=<field>: write the texture
      * sheet once. It used to fire after the hundredth upload, which
@@ -1868,14 +2088,6 @@ void real3d_render(void)
             light[0] = 0.3f; light[1] = 0.5f; light[2] = -0.81f;
         }
 
-        /* A fresh depth buffer per viewport. They are separate layers, not
-         * one scene: sharing a buffer lets whichever viewport is walked
-         * first decide the depth of the whole screen, and the first one
-         * here holds a flat quad that covers it. */
-        {
-            int i, nn = fw * fh;
-            for (i = 0; i < nn; i++) g_zbuf[i] = 1e30f;
-        }
 
         /* No camera matrix. Matrix 0 looked like one -- a plain rotation,
          * sitting where a view transform belongs -- and using it turned the
@@ -1909,7 +2121,7 @@ void real3d_render(void)
         if (!(intensity >= 0.0f)) intensity = 1.0f;   /* NaN guard */
         if (intensity > 2.0f) intensity = 2.0f;
 
-        g_ntris = 0;
+        first = g_ntris;
         {
             /* M3_VP=n draws only viewport n. Three of them share the
              * screen in a round and each gets its own depth buffer, so
@@ -1921,16 +2133,29 @@ void real3d_render(void)
             if (only == -2) { const char *e = getenv("M3_VP");
                               only = e ? strtol(e, NULL, 0) : -1; }
             if (only < 0 || (long)guard == only) {
-                scroll_fog(fb, fw, vp);
+                unsigned *nj = &g_set[g_col].njobs;
+                vpjob_t *j = &g_set[g_col].jobs[*nj < 63u ? (*nj)++ : 63u];
                 descend(rd32le(vp + 0x02 * 4) & 0x00FFFFFFu, &cam, 0);
                 { const char *e = getenv("M3_PICK");
                   g_pick = -1; g_pick_tri = -1;
                   if (e) { int px = atoi(e), py = 0; const char *c = strchr(e, ',');
                            if (c) py = atoi(c + 1);
                            g_pick = (long)py * fw + px; } }
-                raster_bands(fb, fw, fh, sx, sy, light, intensity);
+                j->first = first; j->count = g_ntris - first;
+                g_rtris = g_tris + first; g_rn = j->count;
+                j->s0 = g_nstris;
+                setup_tris(fw, fh, light, intensity);
+                j->s1 = g_nstris;
+                j->proj = g_proj; j->fog = g_fog; j->ambient = g_ambient;
+                j->sx = sx; j->sy = sy; j->intensity = intensity;
+                memcpy(j->light, light, sizeof j->light);
+                j->fogw[0] = rd32le(vp + 0x20 * 4);
+                j->fogw[1] = rd32le(vp + 0x22 * 4);
+                j->fogw[2] = rd32le(vp + 0x25 * 4);
+                j->st = g_stris;
+                if (!g_deferred) draw_job(j, fb, fw, fh);
                 if (g_pick_tri >= 0) {
-                    const tri_t *p = &g_tris[g_pick_tri];
+                    const tri_t *p = &g_tris[first + g_pick_tri];
                     fprintf(stderr, "[pick] vp%u tri %ld tex %d at %u,%u page %u"
                             " %ux%u fmt %u alpha %u test %u texalpha %u lum %u fog %u z %.0f"
                             " rgb %02X%02X%02X uv %.1f,%.1f %.1f,%.1f %.1f,%.1f\n",
@@ -1947,7 +2172,7 @@ void real3d_render(void)
                                 "  degen %u off %u\n",
                         guard, vpaddr & 0x00FFFFFFu,
                         rd32le(vp + 0x14 * 4), rd32le(vp + 0x1A * 4),
-                        g_ntris, g_drawn - before,
+                        g_ntris - first, g_drawn - before,
                         g_cull_back, g_cull_near, g_cull_degen, g_cull_off);
             if (getenv("M3_REAL3D_STATS"))
                 fprintf(stderr, "[real3d]     textured %u tris / %u px,"
@@ -1982,7 +2207,7 @@ void real3d_render(void)
             g_mat_loads = g_mat_max = g_mat_zero = g_mat_bigi = 0;
             g_mat_bigt = 0.0f;
         }
-        total += g_ntris;
+        total = g_ntris;
 
         next = rd32le(vp + 0x01 * 4) & 0x00FFFFFFu;
         if (next == vpaddr) break;
@@ -1990,6 +2215,9 @@ void real3d_render(void)
     }
     }
     g_tri_count = total;
+    /* setup_tris() may have moved the list as it grew */
+    g_set[g_col].stris = g_stris; g_set[g_col].cap_stris = g_cap_stris;
+    { unsigned n; for (n = 0; n < g_set[g_col].njobs; n++) g_set[g_col].jobs[n].st = g_stris; }
 
     /* M3_REAL3D_STATS: how much geometry the game handed us, and how much of
      * it landed. Printed on change rather than per field, because it changes

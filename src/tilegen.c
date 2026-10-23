@@ -58,9 +58,32 @@ void tilegen_enable_layer(int layer, int on)
 /* The tilegen's registers are on the PCI side, so a word read back here is
  * reversed from the way the guest stored it -- 0x7F010000 written is 0x17F
  * seen, which is 383, the last scanline of a 384-line display. */
+/* Copies of the tilegen's VRAM and registers, taken at the end of a field,
+ * for a host that composes the picture on other threads while the guest runs
+ * the next field (model3recomp_end_frame): the guest keeps writing the live
+ * ones. Two, because the next field's copy is taken while the last one is
+ * still being drawn from. g_src picks what the passes draw from: a copy, or
+ * the live VRAM (-1). */
+static uint8_t *g_snap_vram[2];
+static uint32_t g_snap_regs[2][64];
+static int g_src = -1;
+
+void tilegen_snapshot(int k)
+{
+    size_t n = 0;
+    const uint8_t *v = bus_vram(&n);
+    if (!v || k < 0 || k > 1) return;
+    if (!g_snap_vram[k]) g_snap_vram[k] = (uint8_t *)malloc(n);
+    if (!g_snap_vram[k]) return;
+    memcpy(g_snap_vram[k], v, n);
+    memcpy(g_snap_regs[k], bus_tilegen_regs(), sizeof g_snap_regs[k]);
+}
+
+void tilegen_set_source(int k) { g_src = (k >= 0 && k <= 1 && g_snap_vram[k]) ? k : -1; }
+
 static uint32_t reg(unsigned idx)
 {
-    uint32_t v = bus_tilegen_regs()[idx / 4];
+    uint32_t v = (g_src >= 0 ? g_snap_regs[g_src] : bus_tilegen_regs())[idx / 4];
     return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
            ((v >> 8) & 0xFF00u) | ((v >> 24) & 0xFFu);
 }
@@ -221,11 +244,13 @@ static void dump_state(const uint8_t *v)
 }
 #endif
 
-void tilegen_render_pass(int above)
+void tilegen_render_pass(int above) { tilegen_render_rows(above, 0, 383); }
+
+void tilegen_render_rows(int above, int ry0, int ry1)
 {
     int fbw = 0, fbh = 0;
     uint32_t *fb = platform_framebuffer(&fbw, &fbh);
-    const uint8_t *v = bus_vram(NULL);
+    const uint8_t *v = g_src >= 0 ? g_snap_vram[g_src] : bus_vram(NULL);
     int x, y;
 
     if (!fb || !v)
@@ -313,7 +338,7 @@ void tilegen_render_pass(int above)
      *
      * Not done: the per-line scroll table at 0x0F6000. The Lost World never
      * turns it on. */
-    for (y = 0; y < fbh && y < 384; y++) {
+    for (y = ry0 < 0 ? 0 : ry0; y <= ry1 && y < fbh && y < 384; y++) {
         uint32_t stencil = le32(v, VRAM_STENCIL + (uint32_t)y * 4u);
         int pair;
         for (pair = 1; pair >= 0; pair--) {

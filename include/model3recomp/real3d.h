@@ -19,6 +19,18 @@ extern "C" {
 /* Draw the scene into the framebuffer. Clears it; the tilemaps go on top. */
 void real3d_render(void);
 
+/* Deferred: real3d_render() only walks the scene, into one of two sets, and
+ * queues the field's texture uploads with it; real3d_compose(k) draws set k
+ * -- the tilemaps (from tilegen_snapshot(k)) and the 3D -- into the
+ * framebuffer later, on another thread, while the guest walks the next field
+ * into the other set. real3d_set_index() is the set the next walk goes into;
+ * real3d_flip() returns it and moves to the other, and must not be called
+ * until the other set's picture is finished. */
+void real3d_set_deferred(int on);
+int  real3d_set_index(void);
+int  real3d_flip(void);
+void real3d_compose(int k);
+
 /* The VROM texture port at 0x90000000: three registers, and the write to
  * the last one loads a texture that is already in VROM. */
 void real3d_vrom_texture(uint32_t addr, uint32_t header, uint32_t ctrl);
