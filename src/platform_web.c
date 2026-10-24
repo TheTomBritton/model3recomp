@@ -12,9 +12,12 @@
  *   web_audio_*()      44.1 kHz stereo s16 ring + monotonic write counter,
  *                      read by an AudioWorklet straight out of wasm memory
  *   web_quit()         asks the guest to stop at the next field
+ *   web_save_nvram()   writes the battery RAM and EEPROM to the nvram file
  *
  * Settings (ini), the menu bar and netplay prompts are the page's business;
- * this layer keeps nothing between runs.
+ * this layer keeps nothing between runs. A browser has no quit to save the
+ * battery RAM on, so the page calls web_save_nvram() from time to time and
+ * keeps the file (in MEMFS) itself, writing it back before main next runs.
  */
 #include "model3recomp/platform.h"
 #include "model3recomp/model3recomp.h"
@@ -72,6 +75,9 @@ EMSCRIPTEN_KEEPALIVE uint32_t web_audio_size(void) { return AUDIO_RING; }
 EMSCRIPTEN_KEEPALIVE void web_mute(int m) { g_mute = m; }
 EMSCRIPTEN_KEEPALIVE void web_quit(void) { g_quit = 1; }
 EMSCRIPTEN_KEEPALIVE const char *web_status(void) { return g_status; }
+/* Called on the page's thread while the guest runs: a save can catch the
+ * game mid-write, as pulling a cabinet's plug would. */
+EMSCRIPTEN_KEEPALIVE void web_save_nvram(void) { model3recomp_save_nvram(); }
 
 /* ---- the platform API ----------------------------------------------- */
 int platform_init(int w, int h, const char *title)
