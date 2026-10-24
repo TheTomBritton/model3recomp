@@ -13,6 +13,8 @@
  *                      read by an AudioWorklet straight out of wasm memory
  *   web_quit()         asks the guest to stop at the next field
  *   web_save_nvram()   writes the battery RAM and EEPROM to the nvram file
+ *   web_paint_count()  bumped (and futex-notified) by the page at every paint;
+ *                      M3_PACE=display paces the fields on it
  *
  * Settings (ini), the menu bar and netplay prompts are the page's business;
  * this layer keeps nothing between runs. A browser has no quit to save the
@@ -56,6 +58,7 @@ static uint8_t  *g_present[2];         /* RGBA8 copies, one being shown, one bei
 static volatile int      g_front;      /* which of g_present the page should draw */
 static volatile uint32_t g_frames;     /* fields presented */
 static volatile int      g_quit;
+static volatile uint32_t g_paint;      /* the page's paints, for M3_PACE=display */
 static char      g_status[160];
 
 #define AUDIO_RING 16384u              /* frames: ~370 ms at 44.1 kHz */
@@ -75,6 +78,7 @@ EMSCRIPTEN_KEEPALIVE uint32_t web_audio_size(void) { return AUDIO_RING; }
 EMSCRIPTEN_KEEPALIVE void web_mute(int m) { g_mute = m; }
 EMSCRIPTEN_KEEPALIVE void web_quit(void) { g_quit = 1; }
 EMSCRIPTEN_KEEPALIVE const char *web_status(void) { return g_status; }
+EMSCRIPTEN_KEEPALIVE volatile uint32_t *web_paint_count(void) { return &g_paint; }
 /* Called on the page's thread while the guest runs: a save can catch the
  * game mid-write, as pulling a cabinet's plug would. */
 EMSCRIPTEN_KEEPALIVE void web_save_nvram(void) { model3recomp_save_nvram(); }
@@ -162,6 +166,35 @@ void platform_sample(m3_input_t *in)
  * can draw it. M3_NOTHROTTLE turns it off; holding Tab does the same for
  * a moment. The audio ring is kept in step by the worklet's own rate
  * control, not by nudging the period as the SDL layer does. */
+/* M3_PACE=display: a field per paint of a ~60 Hz display instead of the
+ * board's 57.524 Hz. Two clocks of different rates put a repeated picture
+ * on the screen 2.5 times a second, and jitter in when a field is finished
+ * adds a repeated-and-skipped pair whenever the phase is near a paint (275
+ * of 1801 paints measured on an M2). Paced on the paints, every paint shows
+ * a new field and the game runs 4.3% fast, its sound with it; the page tells
+ * the audio worklet. Off by default. Waits at most 100 ms, so a hidden tab
+ * (no paints) runs on the board's clock; a display above ~75 Hz is held to
+ * 13 ms a field. */
+static int pace_display(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("M3_PACE"); on = e && !strcmp(e, "display"); }
+    return on;
+}
+
+static void wait_paint(void)
+{
+    static uint32_t seen;
+    static double last;
+    double t0 = emscripten_get_now();
+    for (;;) {
+        uint32_t p = __atomic_load_n(&g_paint, __ATOMIC_ACQUIRE);
+        double now = emscripten_get_now();
+        if ((p != seen && now - last >= 13.0) || now - t0 >= 100.0) { seen = p; last = now; return; }
+        emscripten_futex_wait((void *)&g_paint, p, p != seen ? 13.0 - (now - last) : 100.0 - (now - t0));
+    }
+}
+
 static void throttle(void)
 {
     static int probed, off;
@@ -169,6 +202,7 @@ static void throttle(void)
     double now;
     if (!probed) { probed = 1; off = getenv("M3_NOTHROTTLE") != NULL; }
     if (off || (g_in.buttons & WEB_BTN_FAST)) { next = 0; return; }
+    if (pace_display()) { wait_paint(); return; }
     now = emscripten_get_now();
     if (!next || now > next + 100.0)   /* first field, or fell far behind */
         next = now;
