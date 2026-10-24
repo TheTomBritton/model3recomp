@@ -132,6 +132,88 @@ uint64_t model3recomp_frame_count(void) { return g_frames; }
 
 void model3recomp_set_frame_hook(void (*hook)(void)) { g_frame_hook = hook; }
 
+/* ---- composing on another thread ------------------------------------------
+ *
+ * The picture of a field -- the tilemaps behind, the 3D, the tilemaps in
+ * front, then the hand-off to the host -- is drawn by a thread of its own
+ * (with the render pool) while the guest runs the next field. Only the scene
+ * walk stays on the guest's thread, because it reads guest memory, and it
+ * goes into the set of buffers the picture being drawn is not using; the
+ * tilemaps are drawn from a copy of their VRAM. A field is shown one field
+ * later than it would be, and in return the guest no longer waits on the
+ * rasteriser, which in a busy scene on a four-core machine is most of a
+ * field.
+ *
+ * On by default in the browser build, where the host throttles in
+ * platform_present() and nothing reads the framebuffer back between fields;
+ * M3_ASYNC_RENDER=0 (or 1) overrides. Not on Windows, which has no pthreads. */
+#ifndef _WIN32
+#include <pthread.h>
+
+static struct {
+    pthread_mutex_t lock;
+    pthread_cond_t  go, done;
+    int busy, set;
+} g_comp = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0 };
+
+static void *compose_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_comp.lock);
+        while (!g_comp.busy) pthread_cond_wait(&g_comp.go, &g_comp.lock);
+        pthread_mutex_unlock(&g_comp.lock);
+        real3d_compose(g_comp.set);         /* the tilemaps and the 3D, on every core */
+        platform_present();
+        pthread_mutex_lock(&g_comp.lock);
+        g_comp.busy = 0;
+        pthread_cond_broadcast(&g_comp.done);
+        pthread_mutex_unlock(&g_comp.lock);
+    }
+    return NULL;
+}
+
+static int async_render(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("M3_ASYNC_RENDER");
+#ifdef __EMSCRIPTEN__
+        on = e ? atoi(e) != 0 : 1;
+#else
+        on = e ? atoi(e) != 0 : 0;
+#endif
+        if (on) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, compose_thread, NULL)) on = 0;
+            else pthread_detach(t);
+        }
+        real3d_set_deferred(on);
+    }
+    return on;
+}
+
+static void compose_wait(void)
+{
+    pthread_mutex_lock(&g_comp.lock);
+    while (g_comp.busy) pthread_cond_wait(&g_comp.done, &g_comp.lock);
+    pthread_mutex_unlock(&g_comp.lock);
+}
+
+static void compose_start(int set)
+{
+    pthread_mutex_lock(&g_comp.lock);
+    g_comp.set = set;
+    g_comp.busy = 1;
+    pthread_cond_signal(&g_comp.go);
+    pthread_mutex_unlock(&g_comp.lock);
+}
+#else
+static int async_render(void) { return 0; }
+static void compose_wait(void) { }
+static void compose_start(int set) { (void)set; }
+#endif
+
 void model3recomp_end_frame(void)
 {
     g_frames++;
@@ -139,42 +221,51 @@ void model3recomp_end_frame(void)
         fprintf(stderr, "[model3recomp] field %llu\n",
                 (unsigned long long)g_frames);
 
-    /* Back to front: the tilemap layers the guest has put behind the 3D,
-     * then the 3D, then the ones it has put in front. Which is which is a
-     * field in the tilegen's register 0x20, and until it was read the sky
-     * was drawn over the dinosaur. */
-    {
-        int fw = 0, fh = 0;
-        uint32_t *fb = platform_framebuffer(&fw, &fh);
-        if (fb) memset(fb, 0, (size_t)fw * (size_t)fh * sizeof(uint32_t));
-    }
-    {
-        /* M3_PROFILE: where a field's time goes, printed every 300. */
-        static int on = -1;
-        static uint64_t t_guest, t_2d, t_3d, t_present, last, n;
-        uint64_t t0, t1, t2, t3, t4;
-        if (on < 0) on = getenv("M3_PROFILE") != NULL;
-        t0 = on ? platform_ticks_us() : 0;
-        tilegen_render_pass(0);
-        t1 = on ? platform_ticks_us() : 0;
-        real3d_render();
-        t2 = on ? platform_ticks_us() : 0;
-        tilegen_render_pass(1);
-        t3 = on ? platform_ticks_us() : 0;
-        platform_present();
-        t4 = on ? platform_ticks_us() : 0;
-        if (on) {
-            if (last) t_guest += t0 - last;
-            t_2d += (t1 - t0) + (t3 - t2); t_3d += t2 - t1; t_present += t4 - t3;
-            last = t4;
-            if (++n % 300 == 0) {
-                extern uint64_t g_board_us, g_wait_us;
-                fprintf(stderr, "[profile] per field: guest %.1f ms  2d %.1f  3d %.1f  present %.1f"
-                                "  sound %.1f (guest waited %.1f)\n",
-                        t_guest / 300000.0, t_2d / 300000.0, t_3d / 300000.0, t_present / 300000.0,
-                        g_board_us / 300000.0, g_wait_us / 300000.0);
-                t_guest = t_2d = t_3d = t_present = 0;
-                g_board_us = g_wait_us = 0;
+    if (async_render()) {
+        int set = real3d_set_index();
+        tilegen_snapshot(set);
+        real3d_render();            /* the walk, into the set the last picture is not using */
+        compose_wait();             /* the last field's picture is finished */
+        real3d_flip();
+        compose_start(set);
+    } else {
+        /* Back to front: the tilemap layers the guest has put behind the 3D,
+         * then the 3D, then the ones it has put in front. Which is which is a
+         * field in the tilegen's register 0x20, and until it was read the sky
+         * was drawn over the dinosaur. */
+        {
+            int fw = 0, fh = 0;
+            uint32_t *fb = platform_framebuffer(&fw, &fh);
+            if (fb) memset(fb, 0, (size_t)fw * (size_t)fh * sizeof(uint32_t));
+        }
+        {
+            /* M3_PROFILE: where a field's time goes, printed every 300. */
+            static int on = -1;
+            static uint64_t t_guest, t_2d, t_3d, t_present, last, n;
+            uint64_t t0, t1, t2, t3, t4;
+            if (on < 0) on = getenv("M3_PROFILE") != NULL;
+            t0 = on ? platform_ticks_us() : 0;
+            tilegen_render_pass(0);
+            t1 = on ? platform_ticks_us() : 0;
+            real3d_render();
+            t2 = on ? platform_ticks_us() : 0;
+            tilegen_render_pass(1);
+            t3 = on ? platform_ticks_us() : 0;
+            platform_present();
+            t4 = on ? platform_ticks_us() : 0;
+            if (on) {
+                if (last) t_guest += t0 - last;
+                t_2d += (t1 - t0) + (t3 - t2); t_3d += t2 - t1; t_present += t4 - t3;
+                last = t4;
+                if (++n % 300 == 0) {
+                    extern uint64_t g_board_us, g_wait_us;
+                    fprintf(stderr, "[profile] per field: guest %.1f ms  2d %.1f  3d %.1f  present %.1f"
+                                    "  sound %.1f (guest waited %.1f)\n",
+                            t_guest / 300000.0, t_2d / 300000.0, t_3d / 300000.0, t_present / 300000.0,
+                            g_board_us / 300000.0, g_wait_us / 300000.0);
+                    t_guest = t_2d = t_3d = t_present = 0;
+                    g_board_us = g_wait_us = 0;
+                }
             }
         }
     }
