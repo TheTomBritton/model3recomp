@@ -126,6 +126,7 @@ static int   g_ambient_forced;
 static int g_light_flip;
 static int g_old_proj;
 static int g_no_fog;        /* M3_NO_FOG: for comparing */
+static int g_old_trans;     /* M3_OLD_TRANSLUCENCY: blend, not the two layers */
 static int g_no_mips;       /* M3_NO_MIPS: base level only */
 static int g_no_spec;       /* M3_NO_SPECULAR */      /* M3_OLD_PROJ: the symmetric whole-screen projection */
 static uint32_t g_scene_hash;
@@ -552,6 +553,7 @@ typedef struct tri_s {
     uint8_t fmt;            /* texel format, 0..7 */
     uint8_t alpha_test;     /* contour: drop low-alpha texels */
     uint8_t tex_alpha;      /* texel alpha makes it see-through */
+    uint8_t layer;          /* translucency pattern select, word 6 bit 17: 0 or 1 */
     uint8_t mirror;         /* bit 0 mirror v, bit 1 mirror u (header word 2) */
     uint8_t fog;            /* fog intensity in 16ths, 0..31 (header word 6) */
     uint8_t spec;           /* specular coefficient 0..63, 0 none (word 0) */
@@ -648,7 +650,7 @@ static unsigned g_ntris;
 static const tri_t *g_rtris;
 static unsigned g_rn;
 
-typedef struct { int on, lum, two_sided, alpha, alpha_test, tex_alpha, mirror, fog, spec, shine; unsigned x, y, page, w, h, fmt; } texdesc_t;
+typedef struct { int on, lum, two_sided, alpha, alpha_test, tex_alpha, layer, mirror, fog, spec, shine; unsigned x, y, page, w, h, fmt; } texdesc_t;
 
 static void emit(const float a[3], const float b[3], const float c[3],
                  const float n[3], uint32_t rgb,
@@ -676,6 +678,7 @@ static void emit(const float a[3], const float b[3], const float c[3],
     t->fmt = (uint8_t)td->fmt;
     t->alpha_test = (uint8_t)td->alpha_test;
     t->tex_alpha = (uint8_t)td->tex_alpha;
+    t->layer = (uint8_t)td->layer;
     t->mirror = (uint8_t)td->mirror;
     t->fog = (uint8_t)td->fog;
     t->spec = (uint8_t)td->spec;
@@ -902,6 +905,10 @@ static void draw_model(uint32_t addr, const mat_t *m)
         td.alpha = (ph[6] & 0x00800000u) ? 255
                  : (int)(((ph[6] >> 18) & 0x1Fu) * 255u / 32u);
         if (td.alpha > 255) td.alpha = 255;
+        /* Bit 17 picks which of the two translucency layers the polygon's
+         * see-through pixels go into (MAME: "translucency pattern
+         * select"); see composite_rows(). */
+        td.layer = (ph[6] & 0x00020000u) != 0;
         td.two_sided = (ph[1] & 0x10u) != 0;
         if (td.w > 2048u) td.w = 2048u;
         if (td.h > 2048u) td.h = 2048u;
@@ -1110,6 +1117,11 @@ static void descend(uint32_t addr, const mat_t *m, int depth)
 static _Thread_local unsigned g_drawn;
 static float *g_zbuf;
 static int g_zw, g_zh;
+/* The two translucency layers: per pixel, the nearest see-through pixel of
+ * each pattern drawn so far this field -- its colour, with its opacity in the
+ * top byte and 0 for none -- and its depth. See composite_rows(). */
+static uint32_t *g_tcol[2];
+static float *g_tz[2];
 
 #define ZNEAR 0.05f
 
@@ -1279,10 +1291,12 @@ static void setup_tris(int fw, int fh, const float L[3], float intensity)
         g_cull_back = g_cull_near = g_cull_degen = g_cull_off = 0;
     }
 
-    /* Opaque first, then the translucent ones over them in submission
-     * order, blended and leaving the depth buffer alone. A polygon whose
+    /* Opaque first, then the translucent ones in submission order, so that
+     * every see-through pixel is tested against the whole opaque scene on
+     * its way into its translucency layer (composite_rows). A polygon whose
      * texels carry alpha (word 6's translucency mode) counts as
-     * translucent: smoke, glass and shadows are made of those. */
+     * translucent: smoke, glass and shadows are made of those. Its fully
+     * opaque texels are drawn as opaque pixels all the same. */
     for (t = 0; t < 2u * g_rn; t++) {
         const tri_t *tr = &g_rtris[t % g_rn];
         /* Screen-space vertices in double. A projected triangle here can
@@ -1619,22 +1633,35 @@ static void raster(const vpjob_t *j, uint32_t *fb, int fw, int by0, int by1)
                             c = m;
                         }
                     }
-                    if (pa < 255) {
+                    if (pa < 255 && !g_old_trans) {
+                        /* A see-through pixel goes into its polygon's
+                         * layer, not onto the picture, and only if it is
+                         * nearer than what that layer already holds here:
+                         * the nearest wins and nothing accumulates. Under
+                         * 1/32 is nothing at all. The depth buffer is the
+                         * opaque scene's alone, so a translucent head no
+                         * longer needs to write it to keep its inside
+                         * from showing over its face. */
+                        const unsigned L = tr->layer;
+                        if (pa < 8u || !(z < g_tz[L][o])) continue;
+                        g_tz[L][o] = (float)z;
+                        g_tcol[L][o] = ((uint32_t)pa << 24) | (c & 0x00FFFFFFu);
+                    } else if (pa < 255) {
+                        /* M3_OLD_TRANSLUCENCY: each polygon blended over
+                         * the last, writing depth from half opaque up. */
                         uint32_t a = pa, d0 = fb[o], m = 0;
                         int sh2;
                         for (sh2 = 0; sh2 < 24; sh2 += 8)
                             m |= ((((c >> sh2) & 0xFFu) * a
                                   + ((d0 >> sh2) & 0xFFu) * (255u - a)) / 255u) << sh2;
                         fb[o] = 0xFF000000u | m;
-                        /* The hardware draws translucency as a stipple
-                         * pattern (MAME's "translucency pattern select"),
-                         * so what it draws writes depth. A pixel at least
-                         * half opaque does here too: the carnotaurus's head
-                         * is 31/32 opaque, and without depth its inside
-                         * was painted over its face. */
                         if (a >= 128u) g_zbuf[o] = (float)z;
                     } else {
                         g_zbuf[o] = (float)z; fb[o] = c;
+                        /* What an opaque pixel covers of the layers is
+                         * gone; what is in front of it stays. */
+                        if (!(g_tz[0][o] < z)) g_tcol[0][o] = 0;
+                        if (!(g_tz[1][o] < z)) g_tcol[1][o] = 0;
                     }
                     g_drawn++;
                     if (tr->textured) g_tex_px++; else g_flat_px++;
@@ -1838,7 +1865,11 @@ static void job_rows(const vpjob_t *j, uint32_t *fb, int fw, int ry0, int ry1)
 {
     int i, n = (ry1 - ry0 + 1) * fw;
     float *z = g_zbuf + (size_t)ry0 * fw;
-    for (i = 0; i < n; i++) z[i] = 1e30f;
+    float *t0 = g_tz[0] + (size_t)ry0 * fw, *t1 = g_tz[1] + (size_t)ry0 * fw;
+    /* The layers' depths start over too, but not their contents: what an
+     * earlier viewport left in them is still to be composited, unless this
+     * one draws over it. */
+    for (i = 0; i < n; i++) z[i] = t0[i] = t1[i] = 1e30f;
     scroll_fog(fb, fw, j, ry0, ry1);
     raster(j, fb, fw, ry0, ry1);
 }
@@ -1847,9 +1878,53 @@ static void job_rows(const vpjob_t *j, uint32_t *fb, int fw, int ry0, int ry1)
 static void draw_job(const vpjob_t *j, uint32_t *fb, int fw, int fh)
 {
     int i, nn = fw * fh;
-    for (i = 0; i < nn; i++) g_zbuf[i] = 1e30f;
+    for (i = 0; i < nn; i++) g_zbuf[i] = g_tz[0][i] = g_tz[1][i] = 1e30f;
     scroll_fog(fb, fw, j, 0, fh - 1);
     raster_bands(j, fb, fw, fh);
+}
+
+/* ---- the translucency layers --------------------------------------------
+ *
+ * The Real3D does not blend. A translucent polygon is drawn as a stipple, a
+ * screen door whose density is its opacity, in one of two patterns that
+ * word 6 bit 17 picks. Polygons with the same pattern cover the same pixels,
+ * so of several behind one another only the nearest is seen: three 40% mist
+ * sheets in a row are a 40% mist, where blending each over the last made
+ * them 78%. Polygons with different patterns cover different pixels, and
+ * where both are present there is nothing left of the scene behind.
+ *
+ * So each pattern is a layer that keeps the nearest see-through pixel at
+ * each position, and the layers go onto the picture once every viewport of
+ * the field is drawn: one layer alone blends by its opacity; both together
+ * cover the pixel with a mix of the two, weighted toward the more opaque.
+ * The stipple itself is averaged away, as it is on a monitor. Checked against
+ * a reference renderer (Supermodel's New3D, the same model) on dumped scenes;
+ * see the lostworld playtest log of 2026-10-25. Each composited pixel is
+ * cleared for the next field. */
+static void composite_rows(uint32_t *fb, int fw, int y0, int y1)
+{
+    size_t o = (size_t)y0 * (size_t)fw, end = (size_t)(y1 + 1) * (size_t)fw;
+    for (; o < end; o++) {
+        uint32_t c1 = g_tcol[0][o], c2 = g_tcol[1][o];
+        uint32_t a1 = c1 >> 24, a2 = c2 >> 24, d = fb[o], m = 0;
+        int sh;
+        if (!(a1 | a2)) continue;
+        g_tcol[0][o] = g_tcol[1][o] = 0;
+        if (a1 && a2) {
+            /* Layer 2's share, in 256ths: half, moved by how much more
+             * opaque it is than layer 1. */
+            uint32_t t = ((a2 + 255u - a1) * 256u + 255u) / 510u;
+            for (sh = 0; sh < 24; sh += 8)
+                m |= ((((c1 >> sh) & 0xFFu) * (256u - t)
+                     + ((c2 >> sh) & 0xFFu) * t + 128u) >> 8) << sh;
+        } else {
+            uint32_t c = a1 ? c1 : c2, a = a1 ? a1 : a2;
+            for (sh = 0; sh < 24; sh += 8)
+                m |= ((((c >> sh) & 0xFFu) * a
+                     + ((d >> sh) & 0xFFu) * (255u - a)) / 255u) << sh;
+        }
+        fb[o] = 0xFF000000u | m;
+    }
 }
 
 /* Deferred texture uploads, in the order the guest made them: a copy of the
@@ -1921,6 +1996,7 @@ static void compose_band(int i)
         tilegen_render_rows(0, y, y1);
         for (n = 0; n < g_set[g_ck].njobs; n++)
             job_rows(&g_set[g_ck].jobs[n], g_pool.fb, fw, y, y1);
+        composite_rows(g_pool.fb, fw, y, y1);
         tilegen_render_rows(1, y, y1);
     }
 }
@@ -1929,7 +2005,8 @@ void real3d_compose(int k)
 {
     int fw = 0, fh = 0;
     uint32_t *fb = platform_framebuffer(&fw, &fh);
-    if (!fb || !g_zbuf || fw != g_zw || fh != g_zh) return;
+    if (!fb || !g_zbuf || !g_tcol[0] || !g_tcol[1] || !g_tz[0] || !g_tz[1]
+        || fw != g_zw || fh != g_zh) return;
     apply_tex(k);
     tilegen_set_source(k);
     g_ck = k;
@@ -1958,6 +2035,7 @@ void real3d_render(void)
         g_light_flip = getenv("M3_LIGHT_FLIP") != NULL;
         g_old_proj = getenv("M3_OLD_PROJ") != NULL;
         g_no_fog = getenv("M3_NO_FOG") != NULL;
+        g_old_trans = getenv("M3_OLD_TRANSLUCENCY") != NULL;
         g_no_mips = getenv("M3_NO_MIPS") != NULL;
         g_no_spec = getenv("M3_NO_SPECULAR") != NULL;
         e = getenv("M3_AMBIENT");
@@ -1978,11 +2056,17 @@ void real3d_render(void)
      * already been drawn into this buffer. */
 
     if (g_zw != fw || g_zh != fh) {
+        int k;
         free(g_zbuf);
         g_zbuf = (float *)malloc(sizeof(float) * (size_t)fw * (size_t)fh);
+        for (k = 0; k < 2; k++) {
+            free(g_tcol[k]); free(g_tz[k]);
+            g_tcol[k] = (uint32_t *)calloc((size_t)fw * (size_t)fh, sizeof(uint32_t));
+            g_tz[k] = (float *)malloc(sizeof(float) * (size_t)fw * (size_t)fh);
+        }
         g_zw = fw; g_zh = fh;
     }
-    if (!g_zbuf) return;
+    if (!g_zbuf || !g_tcol[0] || !g_tcol[1] || !g_tz[0] || !g_tz[1]) return;
     g_ntris = 0;
     g_nstris = 0;
     g_set[g_col].njobs = 0;
@@ -2260,6 +2344,9 @@ void real3d_render(void)
         vpaddr = next;
     }
     }
+    /* Not deferred, every viewport is drawn by now: the translucency
+     * layers go on, before the tilemaps in front of the 3D. */
+    if (!g_deferred) composite_rows(fb, fw, 0, fh - 1);
     g_tri_count = total;
     /* setup_tris() may have moved the list as it grew */
     g_set[g_col].stris = g_stris; g_set[g_col].cap_stris = g_cap_stris;
